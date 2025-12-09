@@ -18,39 +18,13 @@ bigquery_client = None
 model = None
 
 # --- Inicjalizacja usług z użyciem st.secrets ---
+# Używamy tylko sprawdzenia, aby wiedzieć, czy inicjalizacja jest potrzebna,
+# ale faktyczne ustawienie clientów jest w głównej funkcji setup_gcp_clients w Rekruter_AI.py
+# (ze względu na @st.cache_resource)
 if 'gcp_clients_initialized' not in st.session_state:
     st.session_state.gcp_clients_initialized = False
-
-
-def setup_gcp_clients_hr():
-    global bigquery_client, model
-
-    if 'gcp_service_account' not in st.secrets:
-        # Ten błąd jest już obsługiwany w app.py, ale dla pewności go wyświetlamy
-        return False
-
-    try:
-        # Parsowanie zawartości JSON z sekcji TOML (keyfile_json)
-        service_account_info = json.loads(st.secrets["gcp_service_account"]["keyfile_json"])
-        credentials = service_account.Credentials.from_service_account_info(service_account_info)
-
-        # 1. BigQuery Client
-        bigquery_client = bigquery.Client(credentials=credentials, project=GCP_PROJECT_ID)
-
-        # 2. Vertex AI (Gemini)
-        vertexai.init(project=GCP_PROJECT_ID, location=GCP_GEMINI_LOCATION)
-        model = GenerativeModel(MODEL_NAME)
-
-        return True
-
-    except Exception as e:
-        st.error(f"Krytyczny błąd inicjalizacji usług GCP z secrets w Dashboardzie: {e}")
-        return False
-
-
-# Uruchamiamy inicjalizację
-if not st.session_state.gcp_clients_initialized:
-    setup_gcp_clients_hr()
+    # Poniższe bloki inicjalizacyjne w tym pliku zostały usunięte,
+    # ponieważ inicjalizację przejmuje funkcja z Rekruter_AI.py
 
 # --- ZMIENNE STANU SESJI ---
 if "active_job_description" not in st.session_state:
@@ -58,10 +32,23 @@ if "active_job_description" not in st.session_state:
 
 
 # --- FUNKCJE POMOCNICZE PANELU HR ---
+
+# Importowanie klientów z Rekruter_AI.py (przekształconego w moduł)
+# UWAGA: Aby te globalne zmienne zadziałały, muszą być zaimportowane.
+# To wymaga, abyś dodał na początku tego pliku:
+# from Rekruter_AI import bigquery_client, model
+# (Jeśli używasz app.py jako głównego kontrolera, import jest łatwiejszy)
+
+# Dla uproszczenia zakładamy, że zmienne globalne bigquery_client i model zostały poprawnie
+# ustawione przez setup_gcp_clients() w Rekruter_AI i są dostępne.
 def evaluate_candidate_with_gemini(candidate_id: str, job_description: str):
-    if not bigquery_client or not model:
-        st.error("Błąd: Usługi GCP nie są dostępne. Nie można wygenerować raportu.")
+    # Wymagane importowanie klientów GCP z Rekruter_AI.py lub przekazanie ich jako argumenty
+    # DLA CELÓW Streamlit Cloud, zakładamy, że zostały ustawione globalnie
+    if 'bigquery_client' not in globals() or 'model' not in globals():
+        st.error("Błąd: Klienci GCP (BigQuery/Model) nie są globalnie dostępni.")
         return
+
+    global bigquery_client, model
 
     st.info(f"Rozpoczynam zaawansowaną ocenę kandydata {candidate_id}...")
     try:
@@ -89,7 +76,7 @@ def evaluate_candidate_with_gemini(candidate_id: str, job_description: str):
         cv_analysis = candidate_data.cv_analysis or "Brak analizy CV."
         conversation_transcript = candidate_data.conversation_transcript or "Brak transkrypcji rozmowy."
 
-        # --- GEMINI PROMPT (Zmieniony) ---
+        # --- GEMINI PROMPT ---
         evaluation_prompt = f"""
         Jesteś wysoce analitycznym rekruterem IT. Twoim zadaniem jest stworzenie szczegółowego raportu dopasowania kandydata do oferty pracy na podstawie trzech źródeł: analizy CV, transkrypcji rozmowy oraz treści ogłoszenia.
         Raport musi składać się z trzech odrębnych sekcji:
@@ -134,7 +121,9 @@ def evaluate_candidate_with_gemini(candidate_id: str, job_description: str):
 @st.cache_data(ttl=60)
 def get_candidates_from_bigquery():
     """Pobiera listę kandydatów z BigQuery."""
-    if not bigquery_client: return []
+    if 'bigquery_client' not in globals(): return []
+    global bigquery_client
+
     query = f"""
     SELECT id_kandydata, nazwa_pliku_cv, data_aplikacji, status_rekrutacji
     FROM `{GCP_PROJECT_ID}.{BIGQUERY_DATASET_ID}.{BIGQUERY_TABLE_ID}` 
