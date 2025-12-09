@@ -1,54 +1,29 @@
 import streamlit as st
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPIError
-import vertexai
-from vertexai.preview.generative_models import GenerativeModel
-from google.oauth2 import service_account
-import json
 
-# --- KONFIGURACJA ---
-GCP_PROJECT_ID = "ai-recruiter-prod"
-BIGQUERY_DATASET_ID = "rekrutacja_hr"
-BIGQUERY_TABLE_ID = "Kandydaci"
-GCP_GEMINI_LOCATION = "europe-central2"
-MODEL_NAME = "gemini-2.5-flash-lite"
-
-# --- ZMIENNE GLOBALNE KLIENTÓW ---
-bigquery_client = None
-model = None
-
-# --- Inicjalizacja usług z użyciem st.secrets ---
-# Używamy tylko sprawdzenia, aby wiedzieć, czy inicjalizacja jest potrzebna,
-# ale faktyczne ustawienie clientów jest w głównej funkcji setup_gcp_clients w Rekruter_AI.py
-# (ze względu na @st.cache_resource)
-if 'gcp_clients_initialized' not in st.session_state:
-    st.session_state.gcp_clients_initialized = False
-    # Poniższe bloki inicjalizacyjne w tym pliku zostały usunięte,
-    # ponieważ inicjalizację przejmuje funkcja z Rekruter_AI.py
+# --- KLUCZOWA ZMIANA: IMPORT KLIENTÓW Z MODUŁU REKRUTER_AI ---
+# Musimy zaimportować klientów i stan inicjalizacji z głównego modułu
+try:
+    from Rekruter_AI import bigquery_client, model, st_client, search_client, bigquery_client, st, GCP_PROJECT_ID, \
+        BIGQUERY_DATASET_ID, BIGQUERY_TABLE_ID
+except ImportError as e:
+    st.error(
+        f"Krytyczny błąd importu z Rekruter_AI: {e}. Upewnij się, że plik Rekruter_AI.py istnieje i nie zawiera błędów składni.")
+    st.stop()
 
 # --- ZMIENNE STANU SESJI ---
+# Używamy zmiennej stanu z głównego pliku
 if "active_job_description" not in st.session_state:
     st.session_state.active_job_description = ""
 
 
 # --- FUNKCJE POMOCNICZE PANELU HR ---
-
-# Importowanie klientów z Rekruter_AI.py (przekształconego w moduł)
-# UWAGA: Aby te globalne zmienne zadziałały, muszą być zaimportowane.
-# To wymaga, abyś dodał na początku tego pliku:
-# from Rekruter_AI import bigquery_client, model
-# (Jeśli używasz app.py jako głównego kontrolera, import jest łatwiejszy)
-
-# Dla uproszczenia zakładamy, że zmienne globalne bigquery_client i model zostały poprawnie
-# ustawione przez setup_gcp_clients() w Rekruter_AI i są dostępne.
 def evaluate_candidate_with_gemini(candidate_id: str, job_description: str):
-    # Wymagane importowanie klientów GCP z Rekruter_AI.py lub przekazanie ich jako argumenty
-    # DLA CELÓW Streamlit Cloud, zakładamy, że zostały ustawione globalnie
-    if 'bigquery_client' not in globals() or 'model' not in globals():
-        st.error("Błąd: Klienci GCP (BigQuery/Model) nie są globalnie dostępni.")
+    # Sprawdzenie dostępności (klientów zainicjowanych w Rekruter_AI)
+    if not bigquery_client or not model:
+        st.error("Błąd: Usługi GCP nie są dostępne. Sprawdź logs w Rekruter_AI.py.")
         return
-
-    global bigquery_client, model
 
     st.info(f"Rozpoczynam zaawansowaną ocenę kandydata {candidate_id}...")
     try:
@@ -70,13 +45,13 @@ def evaluate_candidate_with_gemini(candidate_id: str, job_description: str):
         candidate_data = next(query_job.result(), None)
 
         if not candidate_data:
-            st.error("Nie znaleziono danych kandydata do oceny. Upewnij się, że kandydat zakończył rozmowę.")
+            st.error("Nie znaleziono danych kandydata do oceny.")
             return
 
         cv_analysis = candidate_data.cv_analysis or "Brak analizy CV."
         conversation_transcript = candidate_data.conversation_transcript or "Brak transkrypcji rozmowy."
 
-        # --- GEMINI PROMPT ---
+        # --- GEMINI PROMPT (Nowy format) ---
         evaluation_prompt = f"""
         Jesteś wysoce analitycznym rekruterem IT. Twoim zadaniem jest stworzenie szczegółowego raportu dopasowania kandydata do oferty pracy na podstawie trzech źródeł: analizy CV, transkrypcji rozmowy oraz treści ogłoszenia.
         Raport musi składać się z trzech odrębnych sekcji:
@@ -107,6 +82,7 @@ def evaluate_candidate_with_gemini(candidate_id: str, job_description: str):
         """
 
         with st.spinner("AI generuje zaawansowany raport dopasowania..."):
+            # Używamy modelu zaimportowanego z Rekruter_AI
             response = model.generate_content(
                 evaluation_prompt,
                 generation_config={"max_output_tokens": 3000, "temperature": 0.3}
@@ -121,8 +97,7 @@ def evaluate_candidate_with_gemini(candidate_id: str, job_description: str):
 @st.cache_data(ttl=60)
 def get_candidates_from_bigquery():
     """Pobiera listę kandydatów z BigQuery."""
-    if 'bigquery_client' not in globals(): return []
-    global bigquery_client
+    if not bigquery_client: return []
 
     query = f"""
     SELECT id_kandydata, nazwa_pliku_cv, data_aplikacji, status_rekrutacji
@@ -143,6 +118,7 @@ def get_candidates_from_bigquery():
 def run_hr_dashboard_interface():
     """Rysuje interfejs HR Dashboard wewnątrz zakładki w app.py."""
 
+    # Sprawdzamy stan inicjalizacji z głównego pliku
     if not st.session_state.gcp_clients_initialized:
         st.warning("Oczekiwanie na zainicjalizowanie usług GCP...")
         return

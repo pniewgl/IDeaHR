@@ -1,20 +1,21 @@
 import streamlit as st
-from google.cloud import storage
-import vertexai
-from vertexai.preview.generative_models import GenerativeModel
-from google.cloud import bigquery
+from google.cloud import storage, bigquery
+from google.api_core.exceptions import GoogleAPIError
+from google.oauth2 import service_account
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.api_core.client_options import ClientOptions
-from google.api_core.exceptions import GoogleAPIError
-from google.oauth2 import service_account  # NOWY IMPORT
+
+import vertexai
+from vertexai.preview.generative_models import GenerativeModel
+
 import uuid
 from datetime import datetime
-import os
-from PyPDF2 import PdfReader
 import json
+from PyPDF2 import PdfReader
+import os
 import time
 
-# --- KONFIGURACJA ---
+# --- KONFIGURACJA STAŁYCH ---
 BUCKET_NAME = "demo-cv-rekrutacja-hrdreamer2"
 GCP_PROJECT_ID = "ai-recruiter-prod"
 GCP_GEMINI_LOCATION = "europe-central2"
@@ -24,83 +25,89 @@ BIGQUERY_DATASET_ID = "rekrutacja_hr"
 BIGQUERY_TABLE_ID = "Kandydaci"
 MODEL_NAME = "gemini-2.5-flash-lite"
 
-# --- ZMIENNE GLOBALNE KLIENTÓW ---
+# --- ZMIENNE GLOBALNE (Zostaną ustawione przez cache_resource) ---
 bigquery_client = None
 storage_client = None
 search_client = None
 model = None
 
-# --- ZMIENNE STANU SESJI ---
-# Ujednolicamy inicjalizację do jednego sprawdzenia w app.py
-if 'gcp_clients_initialized' not in st.session_state:
-    st.session_state.gcp_clients_initialized = False
 
-
-# --- FUNKCJA INICJALIZUJĄCA GCP (Krytyczna poprawka parsowania JSON) ---
+# --- Inicjalizacja usług GCP (Jednorazowa, WYSŁUGA CLOUD) ---
 @st.cache_resource
 def setup_gcp_clients():
-    global bigquery_client, storage_client, search_client, model
+    """Inicjalizuje wszystkich klientów GCP raz i bezpiecznie pobiera poświadczenia z secrets."""
 
     if 'gcp_service_account' not in st.secrets:
-        return False
+        # Ten błąd jest przechwytywany w app.py, ale dla pewności go zwracamy
+        raise Exception("Brak sekcji 'gcp_service_account' w secrets.toml.")
 
+    # 1. Przygotowanie Poświadczeń
+    service_account_info = json.loads(st.secrets["gcp_service_account"]["keyfile_json"])
+    credentials = service_account.Credentials.from_service_account_info(service_account_info)
+
+    # 2. Tworzenie Klientów
     try:
-        # POBRANIE I PRZYGOTOWANIE POŚWIADCZEŃ JSON Z TOML
-        # Używamy json.loads do parsowania JSON, który został wklejony jako ciąg znaków w TOML
-        service_account_info = json.loads(st.secrets["gcp_service_account"]["keyfile_json"])
-        credentials = service_account.Credentials.from_service_account_info(service_account_info)
+        # Klient BigQuery
+        bq_client = bigquery.Client(credentials=credentials, project=GCP_PROJECT_ID)
 
-        # 1. BigQuery Client
-        bigquery_client = bigquery.Client(credentials=credentials, project=GCP_PROJECT_ID)
+        # Klient Storage
+        st_client = storage.Client(credentials=credentials, project=GCP_PROJECT_ID)
 
-        # 2. Storage Client
-        storage_client = storage.Client(credentials=credentials, project=GCP_PROJECT_ID)
+        # Klient Discovery Engine (Search/RAG)
+        client_options = ClientOptions(api_endpoint=f"{GCP_SEARCH_LOCATION}-discoveryengine.googleapis.com")
+        sr_client = discoveryengine.SearchServiceClient(client_options=client_options, credentials=credentials)
 
-        # 3. Vertex AI (Gemini)
-        # UWAGA: Vertex AI init najlepiej działa, gdy poświadczenia są w env
-        # Tworzymy plik tymczasowy na potrzeby Vertex AI, jeśli to konieczne (lepsza kompatybilność)
-        temp_gcp_key_path = "temp_gcp_key.json"
+        # Klient Vertex AI (Gemini)
+        # UWAGA: Vertex AI używa GOOGLE_APPLICATION_CREDENTIALS. Tworzymy tymczasowy plik.
+        temp_gcp_key_path = "temp_gcp_credentials.json"
         with open(temp_gcp_key_path, "w") as f:
             json.dump(service_account_info, f)
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_gcp_key_path
 
         vertexai.init(project=GCP_PROJECT_ID, location=GCP_GEMINI_LOCATION)
-        model = GenerativeModel(MODEL_NAME)
+        ai_model = GenerativeModel(MODEL_NAME)
 
-        # 4. Discovery Engine (Vertex AI Search - RAG)
-        client_options = ClientOptions(api_endpoint=f"{GCP_SEARCH_LOCATION}-discoveryengine.googleapis.com")
-        search_client = discoveryengine.SearchServiceClient(client_options=client_options, credentials=credentials)
+        # Usuwamy tymczasowy plik (najlepiej po zakończeniu sesji, ale dla uproszczenia zostawiamy)
+        # os.remove(temp_gcp_key_path)
 
-        st.session_state.gcp_clients_initialized = True
-        return True
+        return bq_client, st_client, sr_client, ai_model
 
     except Exception as e:
-        # Ostateczny błąd jest wyświetlany w app.py
-        print(f"Krytyczny błąd inicjalizacji usług GCP: {e}")
-        return False
+        raise Exception(f"Błąd inicjalizacji klienta GCP: {e}")
 
 
-# Uruchamiamy inicjalizację, jeśli nie została jeszcze wykonana
-if not st.session_state.gcp_clients_initialized:
-    setup_gcp_clients()
+# Uruchomienie inicjalizacji i ustawienie zmiennych globalnych modułu
+try:
+    bigquery_client, storage_client, search_client, model = setup_gcp_clients()
+    st.session_state.gcp_clients_initialized = True
+except Exception as e:
+    st.session_state.gcp_clients_initialized = False
+    print(f"KRYTYCZNY BŁĄD GLOBALNY (Rekruter_AI): {e}")
+
+# --- ZMIENNE STANU SESJI ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "cv_uploaded_id" not in st.session_state:
+    st.session_state.cv_uploaded_id = None
+if "active_job_description" not in st.session_state:
+    st.session_state.active_job_description = ""
 
 
 # --- FUNKCJE POMOCNICZE (LOGIKA) ---
-# ... (reszta funkcji pozostaje taka sama, używając globalnych zmiennych bigquery_client, storage_client, search_client, model)
-# ... (Usuń st.error/st.warning z wnętrza funkcji, zamień na return None lub raise Exception, bo błędy są obsługiwane w UI)
-# ... (Funkcja run_candidate_interface pozostaje taka sama)
+
 def upload_to_gcs(uploaded_file, bucket_name):
-    if not storage_client: return None
+    if not storage_client: raise Exception("Storage client not initialized.")
     try:
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(uploaded_file.name)
         blob.upload_from_file(uploaded_file, rewind=True)
         return f"gs://{bucket_name}/{uploaded_file.name}"
     except GoogleAPIError as e:
-        return None
+        raise Exception(f"Błąd podczas przesyłania do GCS: {e}")
 
 
-# ... (Wklej resztę kodu funkcji analyze_cv_with_gemini, search_in_knowledge_base, chat_with_ai_agent_via_llm, run_candidate_interface)
+# (Wstaw resztę funkcji - analyze_cv_with_gemini, search_in_knowledge_base, chat_with_ai_agent_via_llm - są one merytorycznie poprawne,
+# ale muszą używać globalnych zmiennych bigquery_client, model, search_client)
 def analyze_cv_with_gemini(cv_text):
     if not cv_text or not model:
         return {"summary": "Błąd: Brak tekstu do analizy lub model AI niezaładowany.", "last_job": None,
@@ -216,9 +223,10 @@ def run_candidate_interface():
                     st.error(f"Błąd odczytu pliku PDF: {e}")
                     return
 
-                gcs_url = upload_to_gcs(uploaded_file, BUCKET_NAME)
-                if not gcs_url:
-                    st.error("Nie udało się przesłać CV do GCS. Sprawdź konfigurację konta GCP.")
+                try:
+                    gcs_url = upload_to_gcs(uploaded_file, BUCKET_NAME)
+                except Exception as e:
+                    st.error(f"Nie udało się przesłać CV do GCS: {e}")
                     return
 
                 analysis_result = analyze_cv_with_gemini(cv_text)
