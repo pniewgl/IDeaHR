@@ -1,4 +1,3 @@
-# Rekruter_AI.py
 import streamlit as st
 from google.cloud import storage
 import vertexai
@@ -7,16 +6,17 @@ from google.cloud import bigquery
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.api_core.client_options import ClientOptions
 from google.api_core.exceptions import GoogleAPIError
+from google.oauth2 import service_account
 import uuid
 from datetime import datetime
 import os
 from PyPDF2 import PdfReader
-import base64
+import json
+import time
 
 # --- KONFIGURACJA ---
 BUCKET_NAME = "demo-cv-rekrutacja-hrdreamer2"
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "key.json"
-GCP_PROJECT_ID = "ai-recruiter-prod"
+GCP_PROJECT_ID = "ai-recruiter-prod"  # Używamy stałego ID, choć powinno być w secrets
 GCP_GEMINI_LOCATION = "europe-central2"
 GCP_SEARCH_LOCATION = "eu"
 DATA_STORE_ID = "ai-rekruter-wiedza_1759606950652"
@@ -24,16 +24,56 @@ BIGQUERY_DATASET_ID = "rekrutacja_hr"
 BIGQUERY_TABLE_ID = "Kandydaci"
 MODEL_NAME = "gemini-2.5-flash-lite"
 
-# --- Inicjalizacja usług ---
-try:
-    vertexai.init(project=GCP_PROJECT_ID, location=GCP_GEMINI_LOCATION)
-    model = GenerativeModel(MODEL_NAME)
-    bigquery_client = bigquery.Client(project=GCP_PROJECT_ID)
-    client_options = ClientOptions(api_endpoint=f"{GCP_SEARCH_LOCATION}-discoveryengine.googleapis.com")
-    search_client = discoveryengine.SearchServiceClient(client_options=client_options)
-except Exception as e:
-    st.error(f"Nieoczekiwany błąd podczas inicjalizacji: {e}")
-    st.stop()
+# --- ZMIENNE GLOBALNE KLIENTÓW ---
+bigquery_client = None
+storage_client = None
+search_client = None
+model = None
+
+# --- Inicjalizacja usług z użyciem st.secrets ---
+# Logika inicjalizacji została opakowana w funkcję setup_gcp_clients, aby uniknąć problemów
+# z wielokrotnym inicjalizowaniem w Streamlit. Uruchamiamy ją tylko raz.
+if 'gcp_clients_initialized' not in st.session_state:
+    st.session_state.gcp_clients_initialized = False
+
+
+def setup_gcp_clients():
+    global bigquery_client, storage_client, search_client, model
+
+    if 'gcp_service_account' not in st.secrets:
+        st.error("Błąd: Nie znaleziono klucza 'gcp_service_account' w secrets.toml. Zobacz instrukcję konfiguracji.")
+        return False
+
+    try:
+        # Parsowanie zawartości JSON z sekcji TOML (keyfile_json)
+        service_account_info = json.loads(st.secrets["gcp_service_account"]["keyfile_json"])
+        credentials = service_account.Credentials.from_service_account_info(service_account_info)
+
+        # 1. BigQuery Client
+        bigquery_client = bigquery.Client(credentials=credentials, project=GCP_PROJECT_ID)
+
+        # 2. Storage Client
+        storage_client = storage.Client(credentials=credentials, project=GCP_PROJECT_ID)
+
+        # 3. Vertex AI (Gemini)
+        vertexai.init(project=GCP_PROJECT_ID, location=GCP_GEMINI_LOCATION)
+        model = GenerativeModel(MODEL_NAME)
+
+        # 4. Discovery Engine (Vertex AI Search - RAG)
+        client_options = ClientOptions(api_endpoint=f"{GCP_SEARCH_LOCATION}-discoveryengine.googleapis.com")
+        search_client = discoveryengine.SearchServiceClient(client_options=client_options, credentials=credentials)
+
+        st.session_state.gcp_clients_initialized = True
+        return True
+
+    except Exception as e:
+        st.error(f"Krytyczny błąd inicjalizacji usług GCP z secrets: {e}")
+        return False
+
+
+# Uruchamiamy inicjalizację
+if not st.session_state.gcp_clients_initialized:
+    setup_gcp_clients()
 
 # --- ZMIENNE STANU SESJI ---
 if "messages" not in st.session_state:
@@ -45,27 +85,12 @@ if "active_job_description" not in st.session_state:
 
 
 # --- FUNKCJE POMOCNICZE ---
-# ... (Wszystkie funkcje pomocnicze są kompletne i poprawne z poprzedniej wersji)
 
-def set_background(image_file):
-    with open(image_file, "rb") as f:
-        img_data = f.read()
-    b64_encoded = base64.b64encode(img_data).decode()
-    style = f"""
-        <style>
-        .stApp {{
-            background-image: url(data:image/png;base64,{b64_encoded});
-            background-size: cover;
-        }}
-        </style>
-    """
-    st.markdown(style, unsafe_allow_html=True)
-
-
+# W funkcji upload_to_gcs używamy teraz globalnego storage_client
 def upload_to_gcs(uploaded_file, bucket_name):
+    if not storage_client: return None
     try:
-        client = storage.Client()
-        bucket = client.bucket(bucket_name)
+        bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(uploaded_file.name)
         blob.upload_from_file(uploaded_file, rewind=True)
         return f"gs://{bucket_name}/{uploaded_file.name}"
@@ -74,10 +99,14 @@ def upload_to_gcs(uploaded_file, bucket_name):
         return None
 
 
+# Pozostałe funkcje (analyze_cv_with_gemini, search_in_knowledge_base, chat_with_ai_agent_via_llm)
+# pozostają merytorycznie takie same, ale muszą od teraz odwoływać się do
+# zmiennych globalnych (model, bigquery_client, search_client), które zostały zainicjalizowane w setup_gcp_clients().
+
 def analyze_cv_with_gemini(cv_text):
-    if not cv_text:
-        return {"summary": "Błąd: Brak tekstu do analizy.", "last_job": None, "last_company": None,
-                "candidate_name": None}
+    if not cv_text or not model:
+        return {"summary": "Błąd: Brak tekstu do analizy lub model AI niezaładowany.", "last_job": None,
+                "last_company": None, "candidate_name": None}
     prompt = f"""
     Jesteś analitykiem HR. Przeanalizuj poniższe CV i wykonaj dwa zadania:
     1.  **Wyciągnij Informacje:** Zidentyfikuj imię kandydata, ostatnie (najnowsze) stanowisko i nazwę firmy. Zwróć je w formacie:
@@ -105,11 +134,12 @@ def analyze_cv_with_gemini(cv_text):
 
 
 def search_in_knowledge_base(query: str, data_store_id: str) -> str:
+    if not search_client: return ""
     serving_config = f"projects/{GCP_PROJECT_ID}/locations/{GCP_SEARCH_LOCATION}/collections/default_collection/dataStores/{data_store_id}/servingConfigs/default_config"
-    content_search_spec = discoveryengine.SearchRequest.ContentSearchSpec(
-        snippet_spec=discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(return_snippet=True))
+    content_search_spec = discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(return_snippet=True)
     request = discoveryengine.SearchRequest(serving_config=serving_config, query=query, page_size=3,
-                                            content_search_spec=content_search_spec)
+                                            content_search_spec=discoveryengine.SearchRequest.ContentSearchSpec(
+                                                snippet_spec=content_search_spec))
     try:
         response = search_client.search(request)
         context_snippets = [result.document.derived_struct_data["snippets"][0]["snippet"] for result in response.results
@@ -119,23 +149,25 @@ def search_in_knowledge_base(query: str, data_store_id: str) -> str:
         if not context_snippets: return ""
         return "\n---\n".join(context_snippets)
     except Exception as e:
-        st.warning(f"Błąd wyszukiwania w bazie wiedzy: {e}")
+        # st.warning(f"Błąd wyszukiwania w bazie wiedzy: {e}")
         return ""
 
 
 def chat_with_ai_agent_via_llm(conversation_history_list, job_description):
+    if not model: return "Przepraszam, model AI jest niedostępny.", True
     user_query = conversation_history_list[-1]["content"]
     context_from_query = search_in_knowledge_base(user_query, DATA_STORE_ID)
-    context_from_job_desc = ""
+
+    job_context_info = ""
     if job_description:
-        job_title = job_description.split('\n')[0].strip()
-        context_from_job_desc = search_in_knowledge_base(job_title, DATA_STORE_ID)
+        job_context_info = search_in_knowledge_base(job_description[:50], DATA_STORE_ID)
+
     combined_knowledge_context = ""
-    if context_from_job_desc: combined_knowledge_context += f"Ogólne informacje o stanowisku:\n{context_from_job_desc}\n\n"
+    if job_context_info: combined_knowledge_context += f"Ogólne informacje o stanowisku:\n{job_context_info}\n\n"
     if context_from_query: combined_knowledge_context += f"Informacje związane z pytaniem kandydata:\n{context_from_query}"
+
     job_context_prompt = f"Prowadzisz rozmowę na stanowisko opisane w tym ogłoszeniu:\n---OGŁOSZENIE---\n{job_description}\n----------------" if job_description else ""
 
-    # === ZMIANA W PROMPCIE: Dodajemy hierarchię priorytetów ===
     base_instructions = f"""
     Jesteś profesjonalnym, ale i pomocnym rekruterem IT. {job_context_prompt}
 
@@ -158,91 +190,93 @@ def chat_with_ai_agent_via_llm(conversation_history_list, job_description):
         is_conversation_end = "[KONIEC ROZMOWY]" in response.text.upper() or is_user_ending
         return response.text.replace("[KONIEC ROZMOWY]", "").strip(), is_conversation_end
     except Exception as e:
-        st.error(f"Błąd podczas rozmowy z AI: {e}")
+        # st.error(f"Błąd podczas rozmowy z AI: {e}") # Usunięto st.error
         return "Przepraszam, wystąpił problem.", True
 
 
-# --- INTERFEJS STRONY GŁÓWNEJ (KANDYDAT) ---
-st.set_page_config(page_title="AI Rekruter", layout="centered")
+# --- INTERFEJS KANDYDATA ---
+def run_candidate_interface():
+    """Rysuje interfejs kandydata wewnątrz zakładki w app.py."""
 
-if os.path.exists("tlo.png"):
-    set_background("tlo.png")
+    if not st.session_state.gcp_clients_initialized:
+        st.error("Usługi GCP nie zostały poprawnie zainicjalizowane. Sprawdź plik secrets.toml.")
+        return
 
-st.title("🤖 Witaj w Wirtualnej Rekrutacji AI")
-if os.path.exists("logo.png"):
-    st.sidebar.image("logo.png", use_container_width=True)
+    st.markdown(
+        "Prześlij swoje CV, aby rozpocząć. Nasz inteligentny asystent przeanalizuje je i rozpocznie z Tobą spersonalizowaną rozmowę.")
 
-st.markdown(
-    "Prześlij swoje CV, aby rozpocząć. Nasz inteligentny asystent przeanalizuje je i rozpocznie z Tobą spersonalizowaną rozmowę.")
+    if not st.session_state.cv_uploaded_id:
+        uploaded_file = st.file_uploader("Załaduj swoje CV (tylko .pdf)", type=["pdf"])
 
-if not st.session_state.cv_uploaded_id:
-    uploaded_file = st.file_uploader("Załaduj swoje CV (tylko .pdf)", type=["pdf"])
+        if uploaded_file:
+            with st.spinner("Przetwarzanie CV..."):
+                cv_text = ""
+                try:
+                    reader = PdfReader(uploaded_file)
+                    for page in reader.pages:
+                        cv_text += page.extract_text() or ""
+                except Exception as e:
+                    st.error(f"Błąd odczytu pliku PDF: {e}")
+                    return
 
-    if uploaded_file:
-        with st.spinner("Przetwarzanie CV..."):
-            cv_text = ""
-            try:
-                reader = PdfReader(uploaded_file)
-                for page in reader.pages:
-                    cv_text += page.extract_text() or ""
-            except Exception as e:
-                st.error(f"Błąd odczytu pliku PDF: {e}")
-                st.stop()
+                gcs_url = upload_to_gcs(uploaded_file, BUCKET_NAME)
+                if not gcs_url:
+                    st.error("Nie udało się przesłać CV do GCS. Sprawdź konfigurację konta GCP.")
+                    return
 
-            gcs_url = upload_to_gcs(uploaded_file, BUCKET_NAME)
-            analysis_result = analyze_cv_with_gemini(cv_text)
-            analysis_summary = analysis_result.get("summary", "Błąd analizy.")
-            candidate_id = str(uuid.uuid4())
+                analysis_result = analyze_cv_with_gemini(cv_text)
+                analysis_summary = analysis_result.get("summary", "Błąd analizy.")
+                candidate_id = str(uuid.uuid4())
 
-            row_to_insert = {"id_kandydata": candidate_id, "nazwa_pliku_cv": uploaded_file.name, "url_cv_gcs": gcs_url,
-                             "data_aplikacji": datetime.now().isoformat(), "tresc_cv": cv_text,
-                             "umiejetnosci_tech": analysis_summary, "status_rekrutacji": "CV przesłane",
-                             "event_type": "cv_uploaded"}
+                row_to_insert = {"id_kandydata": candidate_id, "nazwa_pliku_cv": uploaded_file.name,
+                                 "url_cv_gcs": gcs_url,
+                                 "data_aplikacji": datetime.now().isoformat(), "tresc_cv": cv_text,
+                                 "umiejetnosci_tech": analysis_summary, "status_rekrutacji": "CV przesłane",
+                                 "event_type": "cv_uploaded"}
 
-            table_ref = bigquery_client.dataset(BIGQUERY_DATASET_ID).table(BIGQUERY_TABLE_ID)
-            errors = bigquery_client.insert_rows_json(table_ref, [row_to_insert])
+                table_ref = bigquery_client.dataset(BIGQUERY_DATASET_ID).table(BIGQUERY_TABLE_ID)
+                errors = bigquery_client.insert_rows_json(table_ref, [row_to_insert])
 
-            if not errors:
-                st.session_state.cv_uploaded_id = candidate_id
+                if not errors:
+                    st.session_state.cv_uploaded_id = candidate_id
 
-                candidate_name = analysis_result.get("candidate_name")
-                last_job = analysis_result.get("last_job")
-                last_company = analysis_result.get("last_company")
+                    candidate_name = analysis_result.get("candidate_name")
+                    last_job = analysis_result.get("last_job")
+                    last_company = analysis_result.get("last_company")
 
-                if candidate_name and last_job and last_company:
-                    welcome_message = f"Witaj, {candidate_name}! Dziękuję za przesłanie CV. Widzę, że Twoje ostatnie stanowisko to {last_job} w firmie {last_company}. Opowiedz mi proszę więcej o swoich obowiązkach."
-                elif candidate_name:
-                    welcome_message = f"Witaj, {candidate_name}! Dziękuję za CV. Opowiedz mi proszę o swoim ostatnim doświadczeniu zawodowym."
+                    if candidate_name and last_job and last_company:
+                        welcome_message = f"Witaj, {candidate_name}! Dziękuję za przesłanie CV. Widzę, że Twoje ostatnie stanowisko to {last_job} w firmie {last_company}. Opowiedz mi proszę więcej o swoich obowiązkach."
+                    elif candidate_name:
+                        welcome_message = f"Witaj, {candidate_name}! Dziękuję za CV. Opowiedz mi proszę o swoim ostatnim doświadczeniu zawodowym."
+                    else:
+                        welcome_message = "Dziękuję za przesłanie CV. Opowiedz mi proszę o swoim ostatnim doświadczeniu zawodowym."
+
+                    st.session_state.messages = [{"role": "assistant", "content": welcome_message}]
+                    st.success("Twoje CV zostało przetworzone! Rozpoczynamy rozmowę.")
+                    st.rerun()
                 else:
-                    welcome_message = "Dziękuję za przesłanie CV. Opowiedz mi proszę o swoim ostatnim doświadczeniu zawodowym."
+                    st.error(f"Błąd zapisu danych do BigQuery: {errors}")
 
-                st.session_state.messages = [{"role": "assistant", "content": welcome_message}]
-                st.success("Twoje CV zostało przetworzone!")
-                st.rerun()
-            else:
-                st.error(f"Błąd zapisu danych do BigQuery: {errors}")
+    if st.session_state.cv_uploaded_id:
+        job_desc = st.session_state.get("active_job_description", "")
+        if job_desc:
+            with st.expander("Zobacz opis stanowiska, na które aplikujesz"):
+                st.markdown(job_desc)
 
-if st.session_state.cv_uploaded_id:
-    st.header("🗣️ Rozmowa Kwalifikacyjna")
-    job_desc = st.session_state.get("active_job_description", "")
-    if job_desc:
-        with st.expander("Zobacz opis stanowiska, na które aplikujesz"):
-            st.markdown(job_desc)
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
 
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+        if user_input := st.chat_input("Twoja odpowiedź..."):
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            with st.chat_message("user"):
+                st.markdown(user_input)
 
-    if user_input := st.chat_input("Twoja odpowiedź..."):
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
-
-        with st.chat_message("assistant"):
-            with st.spinner("AI myśli..."):
-                response_text, conversation_ended = chat_with_ai_agent_via_llm(st.session_state.messages, job_desc)
-                st.markdown(response_text)
-                st.session_state.messages.append({"role": "assistant", "content": response_text})
+            with st.chat_message("assistant"):
+                with st.spinner("AI myśli..."):
+                    response_text, conversation_ended = chat_with_ai_agent_via_llm(st.session_state.messages, job_desc)
+                    st.markdown(response_text)
+                    st.session_state.messages.append({"role": "assistant", "content": response_text})
 
                 if conversation_ended:
                     st.success("Dziękujemy za rozmowę! Twój profil zostanie teraz przekazany do rekrutera.")
@@ -263,6 +297,3 @@ if st.session_state.cv_uploaded_id:
                             st.error(f"Nie udało się zapisać transkrypcji: {errors}")
                         else:
                             st.info("Transkrypcja rozmowy została zapisana.")
-                            # update_candidate_status_after_interview(candidate_id_to_save, "Rozmowa AI zakończona")
-
-st.sidebar.info("Przejdź do panelu rekrutera, aby zobaczyć listę kandydatów i zarządzać rekrutacjami.")
