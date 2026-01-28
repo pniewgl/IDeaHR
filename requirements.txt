@@ -1,8 +1,0 @@
-streamlit
-PyPDF2
-google-cloud-bigquery
-google-cloud-storage
-google-cloud-aiplatform
-google-cloud-discoveryengine
-google-auth
-google-api-core
